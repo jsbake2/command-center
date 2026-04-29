@@ -254,6 +254,14 @@ class ServicePoller(QtCore.QObject):
         self._services = services
         self._interval = interval_ms
         self._timer: QtCore.QTimer | None = None
+        # Parallelism: poll all services concurrently so a slow one (docker
+        # stats over a 14-container project, virsh+ssh into the VM, etc.)
+        # doesn't block the rest. One worker per service is plenty.
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(
+            max_workers=max(4, len(services)),
+            thread_name_prefix="svc-poll",
+        )
 
     @QtCore.pyqtSlot()
     def start(self):
@@ -262,22 +270,34 @@ class ServicePoller(QtCore.QObject):
         self._timer.start(self._interval)
         QtCore.QTimer.singleShot(0, self.tick)
 
+    def _poll_one(self, svc: Service) -> 'ServiceTick':
+        try:
+            st = svc.status()
+        except Exception as e:  # noqa: BLE001
+            st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
+        try:
+            m = svc.metrics() if st.state == State.RUNNING else ServiceMetrics()
+        except Exception:
+            m = ServiceMetrics()
+        try:
+            a = svc.autostart()
+        except Exception:
+            a = "unknown"
+        return ServiceTick(svc.key, st, m, a)
+
     @QtCore.pyqtSlot()
     def tick(self):
+        # Fan out — each service polled in its own thread; emit as each completes.
         for svc in self._services:
-            try:
-                st = svc.status()
-            except Exception as e:  # noqa: BLE001
-                st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
-            try:
-                m = svc.metrics() if st.state == State.RUNNING else ServiceMetrics()
-            except Exception:
-                m = ServiceMetrics()
-            try:
-                a = svc.autostart()
-            except Exception:
-                a = "unknown"
-            self.update.emit(ServiceTick(svc.key, st, m, a))
+            fut = self._pool.submit(self._poll_one, svc)
+            fut.add_done_callback(self._on_done)
+
+    def _on_done(self, fut):
+        try:
+            tick = fut.result()
+        except Exception:
+            return
+        self.update.emit(tick)
 
 
 class SystemPoller(QtCore.QObject):
@@ -353,7 +373,7 @@ class SystemPoller(QtCore.QObject):
 
 
 class ActionWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(str, str, object)  # key, action, ActionResult
+    finished = QtCore.pyqtSignal(str, str, object, object)  # key, action, ActionResult, ServiceTick (post-action snapshot)
 
     def __init__(self, service: Service, action: str):
         super().__init__()
@@ -372,7 +392,22 @@ class ActionWorker(QtCore.QObject):
             result = fn() if fn else ActionResult(False, f"unknown action {self._action}")
         except Exception as e:  # noqa: BLE001
             result = ActionResult(False, f"{self._action} raised: {e}")
-        self.finished.emit(self._service.key, self._action, result)
+        # Take a fresh snapshot for this one service so the panel updates
+        # immediately, without waiting for the next global poll tick.
+        try:
+            st = self._service.status()
+        except Exception as e:  # noqa: BLE001
+            st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
+        try:
+            m = self._service.metrics() if st.state == State.RUNNING else ServiceMetrics()
+        except Exception:
+            m = ServiceMetrics()
+        try:
+            a = self._service.autostart()
+        except Exception:
+            a = "unknown"
+        tick = ServiceTick(self._service.key, st, m, a)
+        self.finished.emit(self._service.key, self._action, result, tick)
 
 
 # ---------------------------------------------------------------------------
@@ -865,8 +900,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._action_threads[key] = thread
         thread.start()
 
-    @QtCore.pyqtSlot(str, str, object)
-    def _on_action_finished(self, key: str, action: str, result: ActionResult):
+    @QtCore.pyqtSlot(str, str, object, object)
+    def _on_action_finished(self, key: str, action: str, result: ActionResult, tick: 'ServiceTick'):
         self._busy.discard(key)
         self._action_threads.pop(key, None)
         panel = self.panels.get(key)
@@ -874,10 +909,12 @@ class MainWindow(QtWidgets.QMainWindow):
             panel.set_busy(False)
             marker = "OK" if result.ok else "FAIL"
             panel.append_log(f"[{ts()}] {action.upper()} {marker} — {result.message}")
-        # Force a quick refresh.
-        QtCore.QMetaObject.invokeMethod(self.svc_poller, "tick", QtCore.Qt.ConnectionType.QueuedConnection)
-        QtCore.QTimer.singleShot(2500, lambda: QtCore.QMetaObject.invokeMethod(
-            self.svc_poller, "tick", QtCore.Qt.ConnectionType.QueuedConnection))
+            # Apply the snapshot the worker took right after the action — this
+            # makes the autostart toggle / status pill update *immediately*,
+            # without waiting for the next global poll loop (which can be slow
+            # since it queries every service serially).
+            panel.apply_tick(tick)
+            self._update_sidebar_row(key, tick)
 
     # -- shutdown -----------------------------------------------------------
 
