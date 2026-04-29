@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Launcher for services-panel.
+# Resolves its own location so symlinks from ~/.local/bin or wherever still work.
+
+set -e
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+exec python3 "$DIR/main.py" "$@"
