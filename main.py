@@ -297,7 +297,18 @@ class ServicePoller(QtCore.QObject):
             tick = fut.result()
         except Exception:
             return
-        self.update.emit(tick)
+        # Guard against the case where the QObject has already been destroyed
+        # (e.g. shutdown) — emit would raise RuntimeError otherwise.
+        try:
+            self.update.emit(tick)
+        except RuntimeError:
+            pass
+
+    def shutdown(self):
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
 
 class SystemPoller(QtCore.QObject):
@@ -919,7 +930,11 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        self._action_threads[key] = thread
+        # CRITICAL: keep a Python reference to BOTH the thread and the worker
+        # so Python GC doesn't reap the worker before thread.started fires —
+        # if it gets reaped, Qt silently drops worker.run() and the action
+        # never runs.
+        self._action_threads[key] = (thread, worker)
         thread.start()
 
     @QtCore.pyqtSlot(str, str, object, object)
@@ -942,6 +957,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- shutdown -----------------------------------------------------------
 
     def closeEvent(self, ev):  # noqa: N802
+        # Stop the thread pool first so its callbacks don't try to emit on
+        # signal objects that are about to be destroyed.
+        try:
+            self.svc_poller.shutdown()
+        except Exception:
+            pass
         for t in (getattr(self, "svc_thread", None), getattr(self, "sys_thread", None)):
             if t is None:
                 continue
