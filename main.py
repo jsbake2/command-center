@@ -909,6 +909,13 @@ def ts() -> str:
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("services-panel")
+    # Lets the Wayland compositor (COSMIC) associate this window with the
+    # services-panel.desktop launcher entry so the icon in the dock and the
+    # pinned-launcher behaviour work correctly.
+    app.setDesktopFileName("services-panel")
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services-panel.svg")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QtGui.QIcon(icon_path))
     app.setStyleSheet(QSS)
 
     services = build_catalog()

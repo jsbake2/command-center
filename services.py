@@ -479,6 +479,97 @@ class SystemdService(Service):
 
 
 # ---------------------------------------------------------------------------
+# Hybrid: systemd unit that brings up a docker compose stack
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SystemdComposeService(SystemdService):
+    """A systemd unit (Type=oneshot or similar) whose work is `docker compose
+    up -d` / `docker compose down`. Status comes from the unit's is-active
+    plus container health; metrics come from `docker stats` on the project's
+    containers; start/stop/enable/disable go through systemd so we respect the
+    unit's wrapper logic (patches, healthchecks, etc.)."""
+
+    compose_file: str = ""
+    project_name: str = ""
+    expected_services: int = 0
+
+    def _container_ids(self) -> list[str]:
+        if not self.compose_file:
+            return []
+        cmd = ["docker", "compose", "-f", self.compose_file]
+        if self.project_name:
+            cmd += ["-p", self.project_name]
+        cmd += ["ps", "-q"]
+        rc, out, _ = run(cmd, timeout=10)
+        if rc != 0 or not out:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def status(self) -> ServiceStatus:
+        rc, out, _ = run(["systemctl", "is-active", self.unit], timeout=5)
+        unit_state = (out or "").strip()
+        ids = self._container_ids()
+        running_ct = 0
+        if ids:
+            rc2, out2, _ = run(
+                ["docker", "inspect", "-f", "{{.State.Status}}", *ids],
+                timeout=10,
+            )
+            if rc2 == 0:
+                running_ct = sum(1 for line in out2.splitlines() if line.strip() == "running")
+        if unit_state == "active":
+            if self.expected_services and running_ct < self.expected_services:
+                return ServiceStatus(State.PARTIAL, f"unit active, {running_ct}/{self.expected_services} containers running")
+            return ServiceStatus(State.RUNNING, f"unit active, {running_ct} container(s)")
+        if unit_state == "activating":
+            return ServiceStatus(State.PARTIAL, "starting")
+        if unit_state == "deactivating":
+            return ServiceStatus(State.PARTIAL, "stopping")
+        return ServiceStatus(State.STOPPED, unit_state or "inactive")
+
+    def metrics(self) -> ServiceMetrics:
+        ids = self._container_ids()
+        if not ids:
+            return ServiceMetrics()
+        rc, out, _ = run(
+            ["docker", "stats", "--no-stream", "--format",
+             "{{.CPUPerc}}\t{{.MemUsage}}", *ids],
+            timeout=10,
+        )
+        if rc != 0 or not out:
+            return ServiceMetrics()
+        total_cpu = 0.0
+        total_mem_mb = 0.0
+        n = 0
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            try:
+                total_cpu += float(parts[0].strip().rstrip("%"))
+            except ValueError:
+                pass
+            total_mem_mb += _parse_size_mb(parts[1].strip().split("/")[0].strip())
+            n += 1
+        started = 0.0
+        rc2, out2, _ = run(
+            ["docker", "inspect", "-f", "{{.State.StartedAt}}", *ids],
+            timeout=10,
+        )
+        if rc2 == 0 and out2:
+            for line in out2.splitlines():
+                t = _parse_docker_time(line.strip())
+                if t and (started == 0 or t < started):
+                    started = t
+        # Fall back to the unit's ActiveEnterTimestamp if no containers reported.
+        if started == 0:
+            started = self._started_at()
+        return ServiceMetrics(cpu_pct=total_cpu, mem_mb=total_mem_mb, started_at=started, n_procs=n)
+
+
+# ---------------------------------------------------------------------------
 # Satisfactory VM (libvirt) + in-VM game server service
 # ---------------------------------------------------------------------------
 
@@ -856,13 +947,14 @@ def build_catalog() -> list[Service]:
             project_name="stoat",
             expected_services=14,
         ),
-        ComposeService(
+        SystemdComposeService(
             key="eq2emu",
             label="EQ2 Emulator",
             category="Containers",
-            description="EverQuest II server emulator (compose project)",
+            description="EverQuest II server emulator (eq2emu.service)",
+            unit="eq2emu.service",
             compose_file="/home/jbaker/repos/eq2emu/docker/docker-compose.yaml",
-            project_name="eq2emu",
+            project_name="docker",  # default project = docker dir name
             expected_services=3,
         ),
         SatisfactoryVMService(
