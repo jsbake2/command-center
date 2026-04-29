@@ -382,6 +382,7 @@ class ActionWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
+        _dbg(f"ActionWorker.run start key={self._service.key} action={self._action}")
         try:
             fn = {
                 "start": self._service.start,
@@ -390,24 +391,32 @@ class ActionWorker(QtCore.QObject):
                 "disable": self._service.disable,
             }.get(self._action)
             result = fn() if fn else ActionResult(False, f"unknown action {self._action}")
+            _dbg(f"  result ok={result.ok} msg={result.message}")
         except Exception as e:  # noqa: BLE001
+            _dbg(f"  ACTION RAISED: {type(e).__name__}: {e}")
+            import traceback; _dbg(traceback.format_exc())
             result = ActionResult(False, f"{self._action} raised: {e}")
         # Take a fresh snapshot for this one service so the panel updates
         # immediately, without waiting for the next global poll tick.
         try:
             st = self._service.status()
         except Exception as e:  # noqa: BLE001
+            _dbg(f"  status raised: {e}")
             st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
         try:
             m = self._service.metrics() if st.state == State.RUNNING else ServiceMetrics()
-        except Exception:
+        except Exception as e:
+            _dbg(f"  metrics raised: {e}")
             m = ServiceMetrics()
         try:
             a = self._service.autostart()
-        except Exception:
+        except Exception as e:
+            _dbg(f"  autostart raised: {e}")
             a = "unknown"
         tick = ServiceTick(self._service.key, st, m, a)
+        _dbg(f"  emitting finished tick={tick}")
         self.finished.emit(self._service.key, self._action, result, tick)
+        _dbg(f"  finished emitted")
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +682,17 @@ def _fmt_uptime_short(secs: float) -> str:
 SYSTEM_KEY = "__system__"
 
 
+_DEBUG_LOG_PATH = "/tmp/services-panel.debug.log"
+
+
+def _dbg(msg: str) -> None:
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, services: list[Service]):
         super().__init__()
@@ -867,7 +887,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str, str)
     def _on_action_requested(self, key: str, action: str):
+        _dbg(f"_on_action_requested key={key} action={action} busy_set={self._busy}")
         if key in self._busy:
+            _dbg(f"  REJECTED: already busy")
             return
         svc = next((s for s in self.services if s.key == key), None)
         if svc is None:
@@ -902,6 +924,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str, str, object, object)
     def _on_action_finished(self, key: str, action: str, result: ActionResult, tick: 'ServiceTick'):
+        _dbg(f"_on_action_finished key={key} action={action} ok={result.ok} msg={result.message}")
         self._busy.discard(key)
         self._action_threads.pop(key, None)
         panel = self.panels.get(key)
