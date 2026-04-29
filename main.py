@@ -662,7 +662,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Sidebar
         side_container = QtWidgets.QWidget()
-        side_container.setFixedWidth(240)
+        side_container.setFixedWidth(280)
         side_container.setStyleSheet("background: #0f1218;")
         side_layout = QtWidgets.QVBoxLayout(side_container)
         side_layout.setContentsMargins(0, 0, 0, 0)
@@ -720,7 +720,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for svc in items:
                 row_widget = self._make_sidebar_row(svc)
                 row_item = QtWidgets.QListWidgetItem()
-                row_item.setSizeHint(row_widget.sizeHint())
+                # Force a tall enough row — sizeHint() before layout is unreliable.
+                row_item.setSizeHint(QtCore.QSize(260, 60))
                 row_item.setData(QtCore.Qt.ItemDataRole.UserRole, svc.key)
                 self.sidebar.addItem(row_item)
                 self.sidebar.setItemWidget(row_item, row_widget)
@@ -739,19 +740,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _make_sidebar_row(self, svc: Service) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
+        w.setMinimumHeight(56)
         h = QtWidgets.QHBoxLayout(w)
-        h.setContentsMargins(16, 6, 16, 6)
-        h.setSpacing(10)
+        h.setContentsMargins(16, 10, 16, 10)
+        h.setSpacing(12)
         dot = StatusDot(diameter=10)
         dot.setObjectName(f"sidebarDot_{svc.key}")
-        h.addWidget(dot)
+        h.addWidget(dot, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
         col = QtWidgets.QVBoxLayout()
-        col.setSpacing(0)
+        col.setSpacing(3)
+        col.setContentsMargins(0, 0, 0, 0)
         name = QtWidgets.QLabel(svc.label)
-        name.setStyleSheet("color:#e6e8eb; font-size: 12px; font-weight: 600;")
+        name.setStyleSheet("color:#f3f4f6; font-size: 14px; font-weight: 600; background: transparent;")
+        name.setMinimumHeight(18)
         sub = QtWidgets.QLabel("…")
-        sub.setStyleSheet("color:#6b7280; font-size: 10px;")
+        sub.setStyleSheet("color:#9ca3af; font-size: 11px; background: transparent;")
         sub.setObjectName(f"sidebarSub_{svc.key}")
+        sub.setMinimumHeight(14)
+        # Elide overly long subtitle text instead of squishing the row.
+        sub.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         col.addWidget(name)
         col.addWidget(sub)
         h.addLayout(col, 1)
