@@ -840,9 +840,10 @@ class MainWindow(QtWidgets.QMainWindow):
         panel = self.panels[key]
 
         if action == "disable":
-            if not _confirm(self, "Disable service",
-                            f"Disable “{svc.label}” and prevent it from auto-starting?\n\n"
-                            "This will also stop it now."):
+            if not _confirm(self, "Disable autostart",
+                            f"Disable autostart for “{svc.label}”?\n\n"
+                            "It will not start automatically at boot. "
+                            "The service will keep running if it's running now."):
                 return
         if action == "stop" and svc.kill_style == "hard":
             if not _confirm(self, "Hard kill",
