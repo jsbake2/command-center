@@ -727,8 +727,9 @@ class ProcessApp(Service):
 
     detect_patterns: tuple = ()  # pgrep -f patterns; any match -> RUNNING
     detect_exact: tuple = ()     # pgrep -x names
-    start_cmd: tuple = ()        # argv to exec (detached)
+    start_cmd: tuple = ()        # argv to exec (detached) — used when no desktop_file is set
     start_env: dict = field(default_factory=dict)
+    desktop_file: str = ""       # absolute path to a .desktop file; preferred launch path (gio launch)
     kill_patterns: tuple = ()    # pkill -KILL -f patterns
     kill_exact: tuple = ()       # pkill -KILL -x names
     extra_killers: tuple = ()    # additional argvs to invoke at kill time (e.g. `steam -shutdown`)
@@ -821,24 +822,46 @@ class ProcessApp(Service):
         return clean
 
     def start(self) -> ActionResult:
-        if not self.start_cmd:
-            return ActionResult(False, f"{self.label}: no start command configured")
-        argv = list(self.start_cmd)
-        binary = argv[0]
-        if "/" not in binary and shutil.which(binary) is None:
-            return ActionResult(False, f"{self.label}: '{binary}' not found in PATH")
+        # Prefer launching via the .desktop file (matches what the dock does
+        # and uses the desktop environment's portal/sandbox setup).
+        if self.desktop_file and Path(self.desktop_file).exists() and shutil.which("gio"):
+            argv = ["gio", "launch", self.desktop_file]
+            launch_label = f"gio launch {Path(self.desktop_file).name}"
+        elif self.start_cmd:
+            argv = list(self.start_cmd)
+            binary = argv[0]
+            if "/" not in binary and shutil.which(binary) is None:
+                return ActionResult(False, f"{self.label}: '{binary}' not found in PATH")
+            launch_label = " ".join(argv)
+        else:
+            return ActionResult(False, f"{self.label}: no start command or desktop file configured")
+
+        # Tee stderr to a log so silent failures are debuggable.
+        log_path = f"/tmp/services-panel-{self.key}.launch.log"
         try:
+            with open(log_path, "ab", buffering=0) as logf:
+                logf.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} launch: {' '.join(argv)} ---\n".encode())
+            log_handle = open(log_path, "ab", buffering=0)
             subprocess.Popen(
                 argv,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=log_handle,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 env={**os.environ, **self.start_env},
             )
         except Exception as e:
             return ActionResult(False, f"{self.label}: failed to launch — {e}")
-        return ActionResult(True, f"{self.label}: launching ({' '.join(argv)})")
+
+        # Verify it actually started — give it a few seconds to fork its real
+        # processes, then check our detection patterns. If nothing matches,
+        # surface a useful error instead of a misleading "OK".
+        for _ in range(8):
+            time.sleep(0.5)
+            if self._running_pids():
+                return ActionResult(True, f"{self.label}: launched ({launch_label})")
+        return ActionResult(False, f"{self.label}: launch returned but no matching process appeared "
+                                   f"after 4s — see {log_path}")
 
     def stop(self) -> ActionResult:
         for argv in self.extra_killers:
@@ -981,6 +1004,7 @@ def build_catalog() -> list[Service]:
                 r"\.local/share/Steam/ubuntu12_32/steam ",
                 r"\.local/share/Steam/steam\.sh",
             ),
+            desktop_file="/usr/share/applications/steam.desktop",
             start_cmd=("steam",),
             kill_patterns=(
                 r"\.local/share/Steam/",
@@ -1001,6 +1025,7 @@ def build_catalog() -> list[Service]:
                 r"Battle\.net\.exe",
                 r"Games/battlenet/.*\.exe",
             ),
+            desktop_file="/home/jbaker/.local/share/applications/net.lutris.battlenet-1.desktop",
             start_cmd=("lutris", "lutris:rungame/battlenet"),
             kill_patterns=(
                 r"Battle\.net Launcher\.exe",
