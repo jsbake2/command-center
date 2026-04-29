@@ -306,30 +306,24 @@ class ComposeService(Service):
         return ActionResult(False, err or out or f"compose stop failed (rc={rc})")
 
     def disable(self) -> ActionResult:
-        # Stop first, then flip restart policy on each container so the daemon
-        # won't bring them back at boot.
-        rc, out, err = self._compose("stop", timeout=300)
-        if rc != 0:
-            return ActionResult(False, err or out or "compose stop failed")
+        # Autostart-only: flip restart policy so containers don't auto-restart
+        # on docker daemon start. Leave running containers as they are.
         ids = self._container_ids()
         if not ids:
-            return ActionResult(True, f"{self.label}: stopped (no containers to update)")
-        rc2, out2, err2 = run(
-            ["docker", "update", "--restart=no", *ids],
-            timeout=30,
-        )
-        if rc2 == 0:
-            return ActionResult(True, f"{self.label}: stopped + autostart disabled")
-        return ActionResult(False, err2 or out2 or "docker update failed")
+            return ActionResult(False, f"{self.label}: no containers — start the project first to set policy")
+        rc, out, err = run(["docker", "update", "--restart=no", *ids], timeout=30)
+        if rc == 0:
+            return ActionResult(True, f"{self.label}: autostart disabled (restart=no)")
+        return ActionResult(False, err or out or "docker update failed")
 
     def enable(self) -> ActionResult:
         ids = self._container_ids()
-        if ids:
-            run(["docker", "update", "--restart=unless-stopped", *ids], timeout=30)
-        rc, out, err = self._compose("up", "-d", timeout=600)
+        if not ids:
+            return ActionResult(False, f"{self.label}: no containers — start the project first to set policy")
+        rc, out, err = run(["docker", "update", "--restart=unless-stopped", *ids], timeout=30)
         if rc == 0:
-            return ActionResult(True, f"{self.label}: started + autostart enabled")
-        return ActionResult(False, err or out or "compose up failed")
+            return ActionResult(True, f"{self.label}: autostart enabled (restart=unless-stopped)")
+        return ActionResult(False, err or out or "docker update failed")
 
 
 def _parse_size_mb(s: str) -> float:
@@ -377,11 +371,11 @@ class SystemdService(Service):
     unit: str = ""
     use_sudo: bool = True
 
-    def _systemctl(self, verb: str, *, timeout: int = 30) -> tuple[int, str, str]:
+    def _systemctl(self, verb: str, *args: str, timeout: int = 20) -> tuple[int, str, str]:
         cmd = []
-        if self.use_sudo and verb in ("start", "stop", "restart", "enable", "disable"):
+        if self.use_sudo and verb in ("start", "stop", "restart", "enable", "disable", "reload"):
             cmd += ["sudo", "-n"]
-        cmd += ["systemctl", verb, self.unit]
+        cmd += ["systemctl", verb, *args, self.unit]
         return run(cmd, timeout=timeout)
 
     def status(self) -> ServiceStatus:
@@ -451,30 +445,31 @@ class SystemdService(Service):
         return "unknown"
 
     def start(self) -> ActionResult:
-        rc, out, err = self._systemctl("start")
+        # --no-block returns as soon as the request is queued; the GUI's
+        # status poll observes the transition (activating → active).
+        rc, out, err = self._systemctl("start", "--no-block")
         if rc == 0:
-            return ActionResult(True, f"{self.label}: started")
+            return ActionResult(True, f"{self.label}: start requested")
         return ActionResult(False, err or out or f"systemctl start failed (rc={rc})")
 
     def stop(self) -> ActionResult:
-        rc, out, err = self._systemctl("stop")
+        rc, out, err = self._systemctl("stop", "--no-block")
         if rc == 0:
-            return ActionResult(True, f"{self.label}: stopped gracefully")
+            return ActionResult(True, f"{self.label}: stop requested (graceful)")
         return ActionResult(False, err or out or f"systemctl stop failed (rc={rc})")
 
     def enable(self) -> ActionResult:
+        # Autostart-only: do NOT touch current run state.
         rc, out, err = self._systemctl("enable")
         if rc == 0:
-            self._systemctl("start")
-            return ActionResult(True, f"{self.label}: enabled + started")
+            return ActionResult(True, f"{self.label}: autostart enabled")
         return ActionResult(False, err or out or "systemctl enable failed")
 
     def disable(self) -> ActionResult:
-        # stop + disable so it won't come back at boot
-        self._systemctl("stop")
+        # Autostart-only: do NOT stop the service if it's running.
         rc, out, err = self._systemctl("disable")
         if rc == 0:
-            return ActionResult(True, f"{self.label}: stopped + disabled")
+            return ActionResult(True, f"{self.label}: autostart disabled")
         return ActionResult(False, err or out or "systemctl disable failed")
 
 
@@ -707,17 +702,17 @@ class SatisfactoryVMService(Service):
         return ActionResult(False, text or f"virsh shutdown failed (rc={rc})")
 
     def enable(self) -> ActionResult:
+        # Autostart-only: do not start the VM here.
         rc, out, err = self._virsh("autostart", self.domain, timeout=8)
         if rc == 0:
-            self.start()
             return ActionResult(True, f"{self.label}: autostart enabled")
         return ActionResult(False, err or out or "virsh autostart failed")
 
     def disable(self) -> ActionResult:
-        self.stop()
+        # Autostart-only: leave the VM running if it is.
         rc, out, err = self._virsh("autostart", "--disable", self.domain, timeout=8)
         if rc == 0:
-            return ActionResult(True, f"{self.label}: autostart disabled + shutdown sent")
+            return ActionResult(True, f"{self.label}: autostart disabled")
         return ActionResult(False, err or out or "virsh autostart --disable failed")
 
 
@@ -896,20 +891,17 @@ class ProcessApp(Service):
         return ActionResult(True, f"{self.label}: autostart enabled at {dest}")
 
     def disable(self) -> ActionResult:
+        # Autostart-only: do not kill the running app.
         if not self.autostart_desktop_basename:
-            # No autostart file; just hard-kill the running app.
-            return self.stop()
+            return ActionResult(False, f"{self.label}: autostart not supported")
         dest = Path.home() / ".config" / "autostart" / f"{self.autostart_desktop_basename}.desktop"
-        msg = []
-        if dest.exists():
+        if dest.exists() or dest.is_symlink():
             try:
                 dest.unlink()
-                msg.append("autostart removed")
             except OSError as e:
                 return ActionResult(False, f"{self.label}: could not remove autostart: {e}")
-        kill = self.stop()
-        msg.append(kill.message)
-        return ActionResult(kill.ok, f"{self.label}: " + " — ".join(msg))
+            return ActionResult(True, f"{self.label}: autostart disabled")
+        return ActionResult(True, f"{self.label}: autostart already disabled")
 
     def _find_system_desktop(self) -> Path | None:
         candidates = [
