@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""services-panel — local services + light system monitor.
+"""services-panel — remote services + remote-host hardware monitor.
+
+The panel is a thin client over the services-panel-api running on the
+remote host (default http://10.0.0.16:9090). Set $SERVICES_PANEL_API_URL
+to point elsewhere; token is read from ~/.config/services-panel/token.
 
 Layout:
   ┌────────────┬──────────────────────────────┐
@@ -18,19 +22,20 @@ from __future__ import annotations
 import os
 import sys
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass
+from collections import defaultdict
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-import psutil
-
 from services import (
     ActionResult,
-    Service,
+    ApiClient,
+    ApiError,
+    ServiceMeta,
     ServiceMetrics,
     ServiceStatus,
+    ServiceTick,
     State,
+    SystemTick,
     build_catalog,
     fmt_uptime,
 )
@@ -56,16 +61,27 @@ QListWidget#sidebar {
     outline: 0;
 }
 QListWidget#sidebar::item {
-    padding: 8px 16px;
+    padding: 0;
+    border: none;
+    background: transparent;
+}
+QListWidget#sidebar::item:selected,
+QListWidget#sidebar::item:hover {
+    background: transparent;
+}
+QWidget#sidebarRow {
+    background: transparent;
     border-left: 3px solid transparent;
 }
-QListWidget#sidebar::item:selected {
+QWidget#sidebarRow:hover {
+    background: #141822;
+}
+QWidget#sidebarRow[selected="true"] {
     background: #1a1f2b;
-    color: #f3f4f6;
     border-left: 3px solid #34d399;
 }
-QListWidget#sidebar::item:hover:!selected {
-    background: #141822;
+QWidget#sidebarRow[selected="true"]:hover {
+    background: #1a1f2b;
 }
 QLabel#sidebarHeader {
     font-size: 10px;
@@ -218,50 +234,21 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
 
 
 # ---------------------------------------------------------------------------
-# Background pollers
+# Background pollers — both just call the API on a timer
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class ServiceTick:
-    key: str
-    status: ServiceStatus
-    metrics: ServiceMetrics
-    autostart: str
-
-
-@dataclass
-class SystemTick:
-    cpu_total: float
-    cpu_per_core: list[float]
-    mem_used_mb: float
-    mem_total_mb: float
-    swap_used_mb: float
-    swap_total_mb: float
-    net_rx_per_s: float
-    net_tx_per_s: float
-    disk_read_per_s: float
-    disk_write_per_s: float
-    load_1: float
-    boot_time: float
-
-
 class ServicePoller(QtCore.QObject):
-    update = QtCore.pyqtSignal(object)  # ServiceTick
+    update = QtCore.pyqtSignal(object)  # list[ServiceTick]
+    error = QtCore.pyqtSignal(str)
 
-    def __init__(self, services: list[Service], interval_ms: int = 2500):
+    def __init__(self, client: ApiClient, interval_ms: int = 2500):
         super().__init__()
-        self._services = services
+        self._client = client
         self._interval = interval_ms
         self._timer: QtCore.QTimer | None = None
-        # Parallelism: poll all services concurrently so a slow one (docker
-        # stats over a 14-container project, virsh+ssh into the VM, etc.)
-        # doesn't block the rest. One worker per service is plenty.
         from concurrent.futures import ThreadPoolExecutor
-        self._pool = ThreadPoolExecutor(
-            max_workers=max(4, len(services)),
-            thread_name_prefix="svc-poll",
-        )
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="svc-fetch")
 
     @QtCore.pyqtSlot()
     def start(self):
@@ -270,35 +257,80 @@ class ServicePoller(QtCore.QObject):
         self._timer.start(self._interval)
         QtCore.QTimer.singleShot(0, self.tick)
 
-    def _poll_one(self, svc: Service) -> 'ServiceTick':
+    @QtCore.pyqtSlot()
+    def tick(self):
+        fut = self._pool.submit(self._fetch)
+        fut.add_done_callback(self._on_done)
+
+    def _fetch(self):
+        return self._client.service_ticks()
+
+    def _on_done(self, fut):
         try:
-            st = svc.status()
+            ticks = fut.result()
+        except ApiError as e:
+            try:
+                self.error.emit(str(e))
+            except RuntimeError:
+                pass
+            return
         except Exception as e:  # noqa: BLE001
-            st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
+            try:
+                self.error.emit(f"poller error: {e}")
+            except RuntimeError:
+                pass
+            return
         try:
-            m = svc.metrics() if st.state == State.RUNNING else ServiceMetrics()
-        except Exception:
-            m = ServiceMetrics()
+            self.update.emit(ticks)
+        except RuntimeError:
+            pass
+
+    def shutdown(self):
         try:
-            a = svc.autostart()
+            self._pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
-            a = "unknown"
-        return ServiceTick(svc.key, st, m, a)
+            pass
+
+
+class SystemPoller(QtCore.QObject):
+    update = QtCore.pyqtSignal(object)  # SystemTick
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, client: ApiClient, interval_ms: int = 1500):
+        super().__init__()
+        self._client = client
+        self._interval = interval_ms
+        self._timer: QtCore.QTimer | None = None
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sys-fetch")
+
+    @QtCore.pyqtSlot()
+    def start(self):
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self.tick)
+        self._timer.start(self._interval)
+        QtCore.QTimer.singleShot(0, self.tick)
 
     @QtCore.pyqtSlot()
     def tick(self):
-        # Fan out — each service polled in its own thread; emit as each completes.
-        for svc in self._services:
-            fut = self._pool.submit(self._poll_one, svc)
-            fut.add_done_callback(self._on_done)
+        fut = self._pool.submit(self._client.system)
+        fut.add_done_callback(self._on_done)
 
     def _on_done(self, fut):
         try:
             tick = fut.result()
-        except Exception:
+        except ApiError as e:
+            try:
+                self.error.emit(str(e))
+            except RuntimeError:
+                pass
             return
-        # Guard against the case where the QObject has already been destroyed
-        # (e.g. shutdown) — emit would raise RuntimeError otherwise.
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.error.emit(f"system poll error: {e}")
+            except RuntimeError:
+                pass
+            return
         try:
             self.update.emit(tick)
         except RuntimeError:
@@ -311,123 +343,34 @@ class ServicePoller(QtCore.QObject):
             pass
 
 
-class SystemPoller(QtCore.QObject):
-    update = QtCore.pyqtSignal(object)
-
-    def __init__(self, interval_ms: int = 1500):
-        super().__init__()
-        self._interval = interval_ms
-        self._last_net = None       # (rx, tx, t)
-        self._last_disk = None      # (r, w, t)
-        self._timer: QtCore.QTimer | None = None
-        # Prime cpu_percent so the first tick has a meaningful delta.
-        psutil.cpu_percent(interval=None)
-        psutil.cpu_percent(interval=None, percpu=True)
-
-    @QtCore.pyqtSlot()
-    def start(self):
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self.tick)
-        self._timer.start(self._interval)
-        QtCore.QTimer.singleShot(0, self.tick)
-
-    @QtCore.pyqtSlot()
-    def tick(self):
-        cpu_total = psutil.cpu_percent(interval=None)
-        cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
-        vm = psutil.virtual_memory()
-        sm = psutil.swap_memory()
-        net = psutil.net_io_counters()
-        disk = psutil.disk_io_counters()
-        now = time.monotonic()
-
-        rx_s = tx_s = 0.0
-        if self._last_net:
-            prx, ptx, pt = self._last_net
-            dt = now - pt
-            if dt > 0:
-                rx_s = max(0, (net.bytes_recv - prx) / dt)
-                tx_s = max(0, (net.bytes_sent - ptx) / dt)
-        self._last_net = (net.bytes_recv, net.bytes_sent, now)
-
-        r_s = w_s = 0.0
-        if disk and self._last_disk:
-            pr, pw, pt = self._last_disk
-            dt = now - pt
-            if dt > 0:
-                r_s = max(0, (disk.read_bytes - pr) / dt)
-                w_s = max(0, (disk.write_bytes - pw) / dt)
-        if disk:
-            self._last_disk = (disk.read_bytes, disk.write_bytes, now)
-
-        try:
-            load_1, _, _ = os.getloadavg()
-        except OSError:
-            load_1 = 0.0
-
-        self.update.emit(
-            SystemTick(
-                cpu_total=cpu_total,
-                cpu_per_core=list(cpu_per_core),
-                mem_used_mb=vm.used / (1024 * 1024),
-                mem_total_mb=vm.total / (1024 * 1024),
-                swap_used_mb=sm.used / (1024 * 1024),
-                swap_total_mb=sm.total / (1024 * 1024),
-                net_rx_per_s=rx_s,
-                net_tx_per_s=tx_s,
-                disk_read_per_s=r_s,
-                disk_write_per_s=w_s,
-                load_1=load_1,
-                boot_time=psutil.boot_time(),
-            )
-        )
-
-
 class ActionWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(str, str, object, object)  # key, action, ActionResult, ServiceTick (post-action snapshot)
+    finished = QtCore.pyqtSignal(str, str, object, object)  # key, action, ActionResult, ServiceTick (post-action)
 
-    def __init__(self, service: Service, action: str):
+    def __init__(self, client: ApiClient, key: str, action: str):
         super().__init__()
-        self._service = service
+        self._client = client
+        self._key = key
         self._action = action
 
     @QtCore.pyqtSlot()
     def run(self):
-        _dbg(f"ActionWorker.run start key={self._service.key} action={self._action}")
         try:
-            fn = {
-                "start": self._service.start,
-                "stop": self._service.stop,
-                "enable": self._service.enable,
-                "disable": self._service.disable,
-            }.get(self._action)
-            result = fn() if fn else ActionResult(False, f"unknown action {self._action}")
-            _dbg(f"  result ok={result.ok} msg={result.message}")
+            result, tick = self._client.action(self._key, self._action)
+        except ApiError as e:
+            result = ActionResult(False, str(e))
+            tick = None
         except Exception as e:  # noqa: BLE001
-            _dbg(f"  ACTION RAISED: {type(e).__name__}: {e}")
-            import traceback; _dbg(traceback.format_exc())
             result = ActionResult(False, f"{self._action} raised: {e}")
-        # Take a fresh snapshot for this one service so the panel updates
-        # immediately, without waiting for the next global poll tick.
-        try:
-            st = self._service.status()
-        except Exception as e:  # noqa: BLE001
-            _dbg(f"  status raised: {e}")
-            st = ServiceStatus(State.UNKNOWN, f"status error: {e}")
-        try:
-            m = self._service.metrics() if st.state == State.RUNNING else ServiceMetrics()
-        except Exception as e:
-            _dbg(f"  metrics raised: {e}")
-            m = ServiceMetrics()
-        try:
-            a = self._service.autostart()
-        except Exception as e:
-            _dbg(f"  autostart raised: {e}")
-            a = "unknown"
-        tick = ServiceTick(self._service.key, st, m, a)
-        _dbg(f"  emitting finished tick={tick}")
-        self.finished.emit(self._service.key, self._action, result, tick)
-        _dbg(f"  finished emitted")
+            tick = None
+        # If the API didn't return a fresh state, fall back to a synthetic one.
+        if tick is None:
+            tick = ServiceTick(
+                key=self._key,
+                status=ServiceStatus(State.UNKNOWN, "no state from API"),
+                metrics=ServiceMetrics(),
+                autostart="unknown",
+            )
+        self.finished.emit(self._key, self._action, result, tick)
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +381,11 @@ class ActionWorker(QtCore.QObject):
 class ServicePanel(QtWidgets.QWidget):
     action_requested = QtCore.pyqtSignal(str, str)  # key, action
 
-    def __init__(self, service: Service, parent=None):
+    def __init__(self, meta: ServiceMeta, parent=None):
         super().__init__(parent)
-        self.service = service
+        self.meta = meta
+        # Back-compat: existing code path uses .service in some spots.
+        self.service = meta
         self._busy = False
         self._build()
         self._latest_metrics = ServiceMetrics()
@@ -450,15 +395,14 @@ class ServicePanel(QtWidgets.QWidget):
         outer.setContentsMargins(24, 20, 24, 20)
         outer.setSpacing(14)
 
-        # Header: title + subtitle + status pill
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(12)
         col = QtWidgets.QVBoxLayout()
         col.setSpacing(2)
-        self.title = QtWidgets.QLabel(self.service.label)
+        self.title = QtWidgets.QLabel(self.meta.label)
         self.title.setObjectName("serviceTitle")
-        kill_tag = "  ·  hard kill on stop" if self.service.kill_style == "hard" else ""
-        self.subtitle = QtWidgets.QLabel(f"{self.service.category}  ·  {self.service.description}{kill_tag}")
+        kill_tag = "  ·  hard kill on stop" if self.meta.kill_style == "hard" else ""
+        self.subtitle = QtWidgets.QLabel(f"{self.meta.category}  ·  {self.meta.description}{kill_tag}")
         self.subtitle.setObjectName("serviceSubtitle")
         self.subtitle.setWordWrap(True)
         col.addWidget(self.title)
@@ -476,7 +420,6 @@ class ServicePanel(QtWidgets.QWidget):
         head.addLayout(right, 0)
         outer.addLayout(head)
 
-        # Big numbers row
         big = QtWidgets.QHBoxLayout()
         big.setSpacing(12)
         self.bn_status = BigNumber("Status", "")
@@ -487,7 +430,6 @@ class ServicePanel(QtWidgets.QWidget):
             big.addWidget(w, 1)
         outer.addLayout(big)
 
-        # Sparklines
         spark_row = QtWidgets.QHBoxLayout()
         spark_row.setSpacing(12)
         self.sl_cpu = Sparkline("CPU usage", "%", capacity=120, color="#34d399", max_hint=100.0)
@@ -497,7 +439,6 @@ class ServicePanel(QtWidgets.QWidget):
         spark_row.addWidget(self.sl_mem, 1)
         outer.addLayout(spark_row)
 
-        # Controls
         ctrl_label = QtWidgets.QLabel("Controls", objectName="sectionLabel")
         outer.addWidget(ctrl_label)
         ctrl = QtWidgets.QHBoxLayout()
@@ -517,7 +458,7 @@ class ServicePanel(QtWidgets.QWidget):
             (self.btn_disable, "disable"),
         ):
             b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, a=action: self.action_requested.emit(self.service.key, a))
+            b.clicked.connect(lambda _=False, a=action: self.action_requested.emit(self.meta.key, a))
             ctrl.addWidget(b)
         ctrl.addStretch(1)
         self.kv_autostart = QtWidgets.QLabel("Autostart: —")
@@ -525,7 +466,6 @@ class ServicePanel(QtWidgets.QWidget):
         ctrl.addWidget(self.kv_autostart)
         outer.addLayout(ctrl)
 
-        # Log
         log_label = QtWidgets.QLabel("Activity", objectName="sectionLabel")
         outer.addWidget(log_label)
         self.log = QtWidgets.QPlainTextEdit()
@@ -533,8 +473,6 @@ class ServicePanel(QtWidgets.QWidget):
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(120)
         outer.addWidget(self.log, 1)
-
-    # -- updates ------------------------------------------------------------
 
     def apply_tick(self, tick: ServiceTick):
         if self._busy:
@@ -562,7 +500,6 @@ class ServicePanel(QtWidgets.QWidget):
 
         self._latest_metrics = tick.metrics
         self.kv_autostart.setText(f"Autostart: {tick.autostart}")
-        # Toggle Enable/Disable visibility based on state.
         if tick.autostart == "enabled":
             self.btn_enable.setVisible(False)
             self.btn_disable.setVisible(True)
@@ -570,7 +507,6 @@ class ServicePanel(QtWidgets.QWidget):
             self.btn_enable.setVisible(True)
             self.btn_disable.setVisible(False)
         else:
-            # Unsupported / unknown — show both, but disable.
             self.btn_enable.setVisible(True)
             self.btn_disable.setVisible(True)
             self.btn_enable.setEnabled(tick.autostart != "unsupported")
@@ -590,13 +526,14 @@ class ServicePanel(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------------------
-# System overview panel
+# System overview panel — now showing the REMOTE host's hardware
 # ---------------------------------------------------------------------------
 
 
 class SystemPanel(QtWidgets.QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, host_label: str, parent=None):
         super().__init__(parent)
+        self._host_label = host_label
         self._build()
 
     def _build(self):
@@ -606,13 +543,15 @@ class SystemPanel(QtWidgets.QWidget):
 
         head_col = QtWidgets.QVBoxLayout()
         head_col.setSpacing(2)
-        title = QtWidgets.QLabel("System", objectName="serviceTitle")
-        sub = QtWidgets.QLabel("Live host metrics — updated continuously", objectName="serviceSubtitle")
+        title = QtWidgets.QLabel(f"Host  ·  {self._host_label}", objectName="serviceTitle")
+        sub = QtWidgets.QLabel("Live remote-host metrics — updated continuously", objectName="serviceSubtitle")
         head_col.addWidget(title)
         head_col.addWidget(sub)
         outer.addLayout(head_col)
 
-        # Big numbers
+        self.title_lbl = title
+        self.subtitle_lbl = sub
+
         big = QtWidgets.QHBoxLayout()
         big.setSpacing(12)
         self.bn_cpu = BigNumber("CPU", "%")
@@ -623,7 +562,6 @@ class SystemPanel(QtWidgets.QWidget):
             big.addWidget(w, 1)
         outer.addLayout(big)
 
-        # Charts grid
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(12)
         self.sl_cpu = Sparkline("CPU total", "%", color="#34d399", max_hint=100.0)
@@ -651,6 +589,8 @@ class SystemPanel(QtWidgets.QWidget):
         outer.addLayout(grid, 1)
 
     def apply_tick(self, tick: SystemTick):
+        if tick.hostname:
+            self.title_lbl.setText(f"Host  ·  {tick.hostname}")
         self.sl_cpu.add_value(tick.cpu_total)
         mem_pct = (tick.mem_used_mb / tick.mem_total_mb * 100) if tick.mem_total_mb else 0.0
         self.sl_mem.add_value(mem_pct, sub=f"{tick.mem_used_mb/1024:.1f} / {tick.mem_total_mb/1024:.1f} GiB")
@@ -661,8 +601,9 @@ class SystemPanel(QtWidgets.QWidget):
 
         self.bn_cpu.set_value(f"{tick.cpu_total:.1f}", f"{len(tick.cpu_per_core)} cores")
         self.bn_mem.set_value(f"{mem_pct:.1f}", f"{tick.mem_used_mb/1024:.1f} GiB")
-        self.bn_load.set_value(f"{tick.load_1:.2f}", "")
-        self.bn_uptime.set_value(_fmt_uptime_short(time.time() - tick.boot_time), "since boot")
+        self.bn_load.set_value(f"{tick.load_1:.2f}", f"{tick.load_5:.2f} / {tick.load_15:.2f}")
+        if tick.boot_time:
+            self.bn_uptime.set_value(_fmt_uptime_short(tick.now - tick.boot_time), "since boot")
 
 
 def _fmt_rate(v: float) -> str:
@@ -693,27 +634,18 @@ def _fmt_uptime_short(secs: float) -> str:
 SYSTEM_KEY = "__system__"
 
 
-_DEBUG_LOG_PATH = "/tmp/services-panel.debug.log"
-
-
-def _dbg(msg: str) -> None:
-    try:
-        with open(_DEBUG_LOG_PATH, "a") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-    except OSError:
-        pass
-
-
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, services: list[Service]):
+    def __init__(self, client: ApiClient, services: list[ServiceMeta], host_label: str):
         super().__init__()
         self.setWindowTitle("Services Panel")
         self.resize(1180, 760)
 
+        self.client = client
         self.services = services
+        self.host_label = host_label
         self.panels: dict[str, ServicePanel] = {}
         self._busy: set[str] = set()
-        self._action_threads: dict[str, QtCore.QThread] = {}
+        self._action_threads: dict[str, tuple[QtCore.QThread, "ActionWorker"]] = {}
         self._cards_by_key: dict[str, QtWidgets.QListWidgetItem] = {}
 
         self._build_ui()
@@ -735,11 +667,11 @@ class MainWindow(QtWidgets.QMainWindow):
         side_layout.setSpacing(0)
 
         brand = QtWidgets.QLabel("Services Panel", objectName="sidebarBrand")
-        brand_sub = QtWidgets.QLabel("Local control center", objectName="sidebarBrandSub")
+        brand_sub = QtWidgets.QLabel(self.host_label, objectName="sidebarBrandSub")
         side_layout.addWidget(brand)
         side_layout.addWidget(brand_sub)
 
-        side_layout.addWidget(QtWidgets.QLabel("System", objectName="sidebarHeader"))
+        side_layout.addWidget(QtWidgets.QLabel("Host", objectName="sidebarHeader"))
 
         self.sidebar = QtWidgets.QListWidget(objectName="sidebar")
         self.sidebar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -753,40 +685,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.setStyleSheet("QStackedWidget { background: #0b0d12; }")
         layout.addWidget(self.stack, 1)
 
-        # Build sidebar items + panels
-        self._row_to_key: list[str] = []
+        self._row_to_key: list[str | None] = []
 
         # System overview row
-        self.system_panel = SystemPanel()
+        self.system_panel = SystemPanel(self.host_label)
         self.stack.addWidget(self.system_panel)
-        item = QtWidgets.QListWidgetItem("Overview")
+        item = QtWidgets.QListWidgetItem()
+        item.setSizeHint(QtCore.QSize(260, 40))
         item.setData(QtCore.Qt.ItemDataRole.UserRole, SYSTEM_KEY)
         self.sidebar.addItem(item)
+        self.sidebar.setItemWidget(item, self._make_overview_row())
         self._row_to_key.append(SYSTEM_KEY)
 
-        # Group services by category
-        groups: dict[str, list[Service]] = defaultdict(list)
+        # Group services by category, in catalog order
+        groups: dict[str, list[ServiceMeta]] = defaultdict(list)
         for svc in self.services:
             groups[svc.category].append(svc)
 
         for category, items in groups.items():
-            # Section header (non-selectable).
-            hdr = QtWidgets.QListWidgetItem(category.upper())
+            hdr = QtWidgets.QListWidgetItem()
             hdr.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
-            hdr.setForeground(QtGui.QColor("#6b7280"))
-            f = hdr.font()
-            f.setBold(True)
-            f.setPointSizeF(f.pointSizeF() - 1.0)
-            hdr.setFont(f)
-            hdr.setSizeHint(QtCore.QSize(220, 28))
+            hdr.setSizeHint(QtCore.QSize(260, 32))
             hdr.setData(QtCore.Qt.ItemDataRole.UserRole, None)
             self.sidebar.addItem(hdr)
-            self._row_to_key.append(None)  # skip slot
+            self.sidebar.setItemWidget(hdr, self._make_section_header_row(category))
+            self._row_to_key.append(None)
 
             for svc in items:
                 row_widget = self._make_sidebar_row(svc)
                 row_item = QtWidgets.QListWidgetItem()
-                # Force a tall enough row — sizeHint() before layout is unreliable.
                 row_item.setSizeHint(QtCore.QSize(260, 60))
                 row_item.setData(QtCore.Qt.ItemDataRole.UserRole, svc.key)
                 self.sidebar.addItem(row_item)
@@ -799,13 +726,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.panels[svc.key] = panel
                 self.stack.addWidget(panel)
 
-        # Select first item.
         self.sidebar.setCurrentRow(0)
+        self.statusBar().showMessage(f"Connected to {self.client.base_url}")
 
-        self.statusBar().showMessage("Ready")
-
-    def _make_sidebar_row(self, svc: Service) -> QtWidgets.QWidget:
+    def _make_overview_row(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
+        w.setObjectName("sidebarRow")
+        w.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        w.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover, True)
+        h = QtWidgets.QHBoxLayout(w)
+        h.setContentsMargins(16, 8, 16, 8)
+        h.setSpacing(0)
+        label = QtWidgets.QLabel("Overview")
+        label.setStyleSheet(
+            "color:#f3f4f6; font-size: 14px; font-weight: 600; background: transparent;"
+        )
+        h.addWidget(label, 1)
+        return w
+
+    def _make_section_header_row(self, text: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(w)
+        h.setContentsMargins(16, 14, 16, 4)
+        h.setSpacing(0)
+        label = QtWidgets.QLabel(text.upper())
+        label.setStyleSheet(
+            "color:#6b7280; font-size: 10px; font-weight: 700; "
+            "letter-spacing: 1.5px; background: transparent;"
+        )
+        h.addWidget(label, 1)
+        return w
+
+    def _make_sidebar_row(self, svc: ServiceMeta) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        w.setObjectName("sidebarRow")
+        w.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        w.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover, True)
         w.setMinimumHeight(56)
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(16, 10, 16, 10)
@@ -824,7 +780,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sub.setStyleSheet("color:#9ca3af; font-size: 11px; background: transparent;")
         sub.setObjectName(f"sidebarSub_{svc.key}")
         sub.setMinimumHeight(14)
-        # Elide overly long subtitle text instead of squishing the row.
         sub.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         col.addWidget(name)
         col.addWidget(sub)
@@ -851,32 +806,38 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- Polling ------------------------------------------------------------
 
     def _start_pollers(self):
-        # Service poller thread
         self.svc_thread = QtCore.QThread(self)
-        self.svc_poller = ServicePoller(self.services, interval_ms=2500)
+        self.svc_poller = ServicePoller(self.client, interval_ms=2500)
         self.svc_poller.moveToThread(self.svc_thread)
         self.svc_thread.started.connect(self.svc_poller.start)
-        self.svc_poller.update.connect(self._on_service_tick)
+        self.svc_poller.update.connect(self._on_service_ticks)
+        self.svc_poller.error.connect(self._on_api_error)
         self.svc_thread.start()
 
-        # System poller thread
         self.sys_thread = QtCore.QThread(self)
-        self.sys_poller = SystemPoller(interval_ms=1500)
+        self.sys_poller = SystemPoller(self.client, interval_ms=1500)
         self.sys_poller.moveToThread(self.sys_thread)
         self.sys_thread.started.connect(self.sys_poller.start)
         self.sys_poller.update.connect(self._on_system_tick)
+        self.sys_poller.error.connect(self._on_api_error)
         self.sys_thread.start()
 
     @QtCore.pyqtSlot(object)
-    def _on_service_tick(self, tick: ServiceTick):
-        self._update_sidebar_row(tick.key, tick)
-        panel = self.panels.get(tick.key)
-        if panel and not panel._busy:
-            panel.apply_tick(tick)
+    def _on_service_ticks(self, ticks):
+        for tick in ticks:
+            self._update_sidebar_row(tick.key, tick)
+            panel = self.panels.get(tick.key)
+            if panel and not panel._busy:
+                panel.apply_tick(tick)
+        self.statusBar().showMessage(f"Connected to {self.client.base_url}  ·  last update {time.strftime('%H:%M:%S')}")
 
     @QtCore.pyqtSlot(object)
     def _on_system_tick(self, tick: SystemTick):
         self.system_panel.apply_tick(tick)
+
+    @QtCore.pyqtSlot(str)
+    def _on_api_error(self, msg: str):
+        self.statusBar().showMessage(f"API error: {msg}")
 
     @QtCore.pyqtSlot(int)
     def _on_row_changed(self, row: int):
@@ -884,7 +845,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         key = self._row_to_key[row]
         if key is None:
-            # Section header — pick the next selectable row.
             self.sidebar.setCurrentRow(row + 1)
             return
         if key == SYSTEM_KEY:
@@ -893,29 +853,40 @@ class MainWindow(QtWidgets.QMainWindow):
             panel = self.panels.get(key)
             if panel:
                 self.stack.setCurrentWidget(panel)
+        self._refresh_sidebar_selection(row)
+
+    def _refresh_sidebar_selection(self, current_row: int) -> None:
+        for r in range(self.sidebar.count()):
+            item = self.sidebar.item(r)
+            widget = self.sidebar.itemWidget(item)
+            if widget is None or widget.objectName() != "sidebarRow":
+                continue
+            is_selected = "true" if r == current_row else "false"
+            if widget.property("selected") != is_selected:
+                widget.setProperty("selected", is_selected)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
 
     # -- Actions ------------------------------------------------------------
 
     @QtCore.pyqtSlot(str, str)
     def _on_action_requested(self, key: str, action: str):
-        _dbg(f"_on_action_requested key={key} action={action} busy_set={self._busy}")
         if key in self._busy:
-            _dbg(f"  REJECTED: already busy")
             return
-        svc = next((s for s in self.services if s.key == key), None)
-        if svc is None:
+        meta = next((s for s in self.services if s.key == key), None)
+        if meta is None:
             return
         panel = self.panels[key]
 
         if action == "disable":
             if not _confirm(self, "Disable autostart",
-                            f"Disable autostart for “{svc.label}”?\n\n"
+                            f"Disable autostart for “{meta.label}”?\n\n"
                             "It will not start automatically at boot. "
                             "The service will keep running if it's running now."):
                 return
-        if action == "stop" and svc.kill_style == "hard":
+        if action == "stop" and meta.kill_style == "hard":
             if not _confirm(self, "Hard kill",
-                            f"Force-kill “{svc.label}”? Unsaved progress in the app may be lost."):
+                            f"Force-kill “{meta.label}”? Unsaved progress in the app may be lost."):
                 return
 
         self._busy.add(key)
@@ -923,23 +894,19 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.append_log(f"[{ts()}] {action.upper()} requested")
 
         thread = QtCore.QThread(self)
-        worker = ActionWorker(svc, action)
+        worker = ActionWorker(self.client, key, action)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_action_finished)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        # CRITICAL: keep a Python reference to BOTH the thread and the worker
-        # so Python GC doesn't reap the worker before thread.started fires —
-        # if it gets reaped, Qt silently drops worker.run() and the action
-        # never runs.
+        # Keep refs so Python GC doesn't reap the worker before run() fires.
         self._action_threads[key] = (thread, worker)
         thread.start()
 
     @QtCore.pyqtSlot(str, str, object, object)
-    def _on_action_finished(self, key: str, action: str, result: ActionResult, tick: 'ServiceTick'):
-        _dbg(f"_on_action_finished key={key} action={action} ok={result.ok} msg={result.message}")
+    def _on_action_finished(self, key: str, action: str, result: ActionResult, tick: ServiceTick):
         self._busy.discard(key)
         self._action_threads.pop(key, None)
         panel = self.panels.get(key)
@@ -947,20 +914,18 @@ class MainWindow(QtWidgets.QMainWindow):
             panel.set_busy(False)
             marker = "OK" if result.ok else "FAIL"
             panel.append_log(f"[{ts()}] {action.upper()} {marker} — {result.message}")
-            # Apply the snapshot the worker took right after the action — this
-            # makes the autostart toggle / status pill update *immediately*,
-            # without waiting for the next global poll loop (which can be slow
-            # since it queries every service serially).
             panel.apply_tick(tick)
             self._update_sidebar_row(key, tick)
 
     # -- shutdown -----------------------------------------------------------
 
     def closeEvent(self, ev):  # noqa: N802
-        # Stop the thread pool first so its callbacks don't try to emit on
-        # signal objects that are about to be destroyed.
         try:
             self.svc_poller.shutdown()
+        except Exception:
+            pass
+        try:
+            self.sys_poller.shutdown()
         except Exception:
             pass
         for t in (getattr(self, "svc_thread", None), getattr(self, "sys_thread", None)):
@@ -988,20 +953,39 @@ def ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def _bootstrap_with_retry(client: ApiClient, max_attempts: int = 3) -> tuple[list[ServiceMeta], str]:
+    """Fetch the service catalog + host label, with friendly errors."""
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            metas = build_catalog(client)
+            health = client.health()
+            host = health.get("hostname") or "remote"
+            return metas, host
+        except ApiError as e:
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+    raise SystemExit(
+        f"\nservices-panel could not reach the API at {client.base_url}.\n"
+        f"  Error: {last_err}\n\n"
+        f"Check that services-panel-api is running on the remote host:\n"
+        f"  ssh 10.0.0.16 systemctl status services-panel-api\n"
+        f"And that ~/.config/services-panel/token matches the server's token."
+    )
+
+
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("services-panel")
-    # Lets the Wayland compositor (COSMIC) associate this window with the
-    # services-panel.desktop launcher entry so the icon in the dock and the
-    # pinned-launcher behaviour work correctly.
     app.setDesktopFileName("services-panel")
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services-panel.svg")
     if os.path.exists(icon_path):
         app.setWindowIcon(QtGui.QIcon(icon_path))
     app.setStyleSheet(QSS)
 
-    services = build_catalog()
-    win = MainWindow(services)
+    client = ApiClient()
+    services, host = _bootstrap_with_retry(client)
+    win = MainWindow(client, services, host)
     win.show()
     return app.exec()
 
